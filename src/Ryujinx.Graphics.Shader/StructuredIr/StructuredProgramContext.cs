@@ -3,7 +3,6 @@ using Ryujinx.Graphics.Shader.Translation;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
-
 using static Ryujinx.Graphics.Shader.StructuredIr.AstHelper;
 
 namespace Ryujinx.Graphics.Shader.StructuredIr
@@ -165,7 +164,7 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
             // this is not valid as the loop condition would be evaluated,
             // and it could erroneously jump back to the start of the loop.
             bool inRange =
-                block.Branch.Index <  _currEndIndex ||
+                block.Branch.Index < _currEndIndex ||
                (block.Branch.Index == _currEndIndex && block.Branch.Index < _loopEndIndex);
 
             bool isLoop = block.Branch.Index <= block.Index;
@@ -184,11 +183,11 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
 
                 AddNode(Assign(gotoTempAsg.Destination, cond));
 
-                AstOperation branch = new AstOperation(branchOp.Inst);
+                AstOperation branch = new(branchOp.Inst);
 
                 AddNode(branch);
 
-                GotoStatement gotoStmt = new GotoStatement(branch, gotoTempAsg, isLoop);
+                GotoStatement gotoStmt = new(branch, gotoTempAsg, isLoop);
 
                 _gotos.Add(gotoStmt);
             }
@@ -236,13 +235,13 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
 
         private void NewBlock(AstBlockType type, IAstNode cond, int endIndex)
         {
-            AstBlock childBlock = new AstBlock(type, cond);
+            AstBlock childBlock = new(type, cond);
 
             AddNode(childBlock);
 
             _blockStack.Push((_currBlock, _currEndIndex, _loopEndIndex));
 
-            _currBlock    = childBlock;
+            _currBlock = childBlock;
             _currEndIndex = endIndex;
 
             if (type == AstBlockType.DoWhile)
@@ -298,6 +297,33 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
             return newTemp;
         }
 
+        public IAstNode GetOperandOrCbLoad(Operand operand)
+        {
+            if (operand.Type == OperandType.ConstantBuffer)
+            {
+                int cbufSlot = operand.GetCbufSlot();
+                int cbufOffset = operand.GetCbufOffset();
+
+                int binding = Config.ResourceManager.GetConstantBufferBinding(cbufSlot);
+                int vecIndex = cbufOffset >> 2;
+                int elemIndex = cbufOffset & 3;
+
+                Config.ResourceManager.SetUsedConstantBufferBinding(binding);
+
+                IAstNode[] sources = new IAstNode[]
+                {
+                    new AstOperand(OperandType.Constant, binding),
+                    new AstOperand(OperandType.Constant, 0),
+                    new AstOperand(OperandType.Constant, vecIndex),
+                    new AstOperand(OperandType.Constant, elemIndex),
+                };
+
+                return new AstOperation(Instruction.Load, StorageKind.ConstantBuffer, false, sources, sources.Length);
+            }
+
+            return GetOperand(operand);
+        }
+
         public AstOperand GetOperand(Operand operand)
         {
             if (operand == null)
@@ -307,11 +333,6 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
 
             if (operand.Type != OperandType.LocalVariable)
             {
-                if (operand.Type == OperandType.ConstantBuffer)
-                {
-                    Config.SetUsedConstantBuffer(operand.GetCbufSlot());
-                }
-
                 return new AstOperand(operand);
             }
 

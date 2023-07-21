@@ -5,6 +5,7 @@ using Ryujinx.Graphics.Shader.IntermediateRepresentation;
 using Ryujinx.Graphics.Shader.StructuredIr;
 using Ryujinx.Graphics.Shader.Translation.Optimizations;
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using static Ryujinx.Graphics.Shader.IntermediateRepresentation.OperandHelper;
 
@@ -44,7 +45,14 @@ namespace Ryujinx.Graphics.Shader.Translation
                 }
             }
 
-            Function[] funcs = new Function[functions.Length];
+            List<Function> funcs = new(functions.Length);
+
+            for (int i = 0; i < functions.Length; i++)
+            {
+                funcs.Add(null);
+            }
+
+            HelperFunctionManager hfm = new(funcs, config.Stage);
 
             for (int i = 0; i < functions.Length; i++)
             {
@@ -57,7 +65,7 @@ namespace Ryujinx.Graphics.Shader.Translation
                 {
                     var fru = frus[i];
 
-                    inArgumentsCount  = fru.InArguments.Length;
+                    inArgumentsCount = fru.InArguments.Length;
                     outArgumentsCount = fru.OutArguments.Length;
                 }
 
@@ -70,8 +78,8 @@ namespace Ryujinx.Graphics.Shader.Translation
 
                     Ssa.Rename(cfg.Blocks);
 
-                    Optimizer.RunPass(cfg.Blocks, config);
-                    Rewriter.RunPass(cfg.Blocks, config);
+                    Optimizer.RunPass(hfm, cfg.Blocks, config);
+                    Rewriter.RunPass(hfm, cfg.Blocks, config);
                 }
 
                 funcs[i] = new Function(cfg.Blocks, $"fun{i}", false, inArgumentsCount, outArgumentsCount);
@@ -87,7 +95,7 @@ namespace Ryujinx.Graphics.Shader.Translation
             {
                 TargetLanguage.Glsl => new ShaderProgram(info, TargetLanguage.Glsl, GlslGenerator.Generate(sInfo, config)),
                 TargetLanguage.Spirv => new ShaderProgram(info, TargetLanguage.Spirv, SpirvGenerator.Generate(sInfo, config)),
-                _ => throw new NotImplementedException(config.Options.TargetLanguage.ToString())
+                _ => throw new NotImplementedException(config.Options.TargetLanguage.ToString()),
             };
         }
 
@@ -99,7 +107,7 @@ namespace Ryujinx.Graphics.Shader.Translation
 
             if (options.Flags.HasFlag(TranslationFlags.Compute))
             {
-                config = new ShaderConfig(gpuAccessor, options);
+                config = new ShaderConfig(ShaderStage.Compute, gpuAccessor, options, gpuAccessor.QueryComputeLocalMemorySize());
 
                 program = Decoder.Decode(config, address);
             }
@@ -132,7 +140,7 @@ namespace Ryujinx.Graphics.Shader.Translation
 
             FunctionMatch.RunPass(program);
 
-            foreach (DecodedFunction function in program.OrderBy(x => x.Address).Where(x => !x.IsCompilerGenerated))
+            foreach (DecodedFunction function in program.Where(x => !x.IsCompilerGenerated).OrderBy(x => x.Address))
             {
                 program.AddFunctionAndSetId(function);
             }
@@ -141,7 +149,7 @@ namespace Ryujinx.Graphics.Shader.Translation
 
             for (int index = 0; index < functions.Length; index++)
             {
-                EmitterContext context = new EmitterContext(program, config, index != 0);
+                EmitterContext context = new(program, config, index != 0);
 
                 if (initializeOutputs && index == 0)
                 {
@@ -298,7 +306,7 @@ namespace Ryujinx.Graphics.Shader.Translation
                     context.Add(new CommentNode(dbgComment));
                 }
 
-                InstConditional opConditional = new InstConditional(op.RawOpCode);
+                InstConditional opConditional = new(op.RawOpCode);
 
                 bool noPred = op.Props.HasFlag(InstProps.NoPred);
                 if (!noPred && opConditional.Pred == RegisterConsts.PredicateTrueIndex && opConditional.PredInv)

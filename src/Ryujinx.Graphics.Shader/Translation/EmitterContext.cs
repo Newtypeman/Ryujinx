@@ -4,7 +4,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.CompilerServices;
-
 using static Ryujinx.Graphics.Shader.IntermediateRepresentation.OperandHelper;
 
 namespace Ryujinx.Graphics.Shader.Translation
@@ -49,13 +48,17 @@ namespace Ryujinx.Graphics.Shader.Translation
         private readonly List<Operation> _operations;
         private readonly Dictionary<ulong, BlockLabel> _labels;
 
-        public EmitterContext(DecodedProgram program, ShaderConfig config, bool isNonMain)
+        public EmitterContext()
+        {
+            _operations = new List<Operation>();
+            _labels = new Dictionary<ulong, BlockLabel>();
+        }
+
+        public EmitterContext(DecodedProgram program, ShaderConfig config, bool isNonMain) : this()
         {
             Program = program;
             Config = config;
             IsNonMain = isNonMain;
-            _operations = new List<Operation>();
-            _labels = new Dictionary<ulong, BlockLabel>();
 
             EmitStart();
         }
@@ -80,7 +83,7 @@ namespace Ryujinx.Graphics.Shader.Translation
 
         public Operand Add(Instruction inst, Operand dest = null, params Operand[] sources)
         {
-            Operation operation = new Operation(inst, dest, sources);
+            Operation operation = new(inst, dest, sources);
 
             _operations.Add(operation);
 
@@ -89,7 +92,7 @@ namespace Ryujinx.Graphics.Shader.Translation
 
         public Operand Add(Instruction inst, StorageKind storageKind, Operand dest = null, params Operand[] sources)
         {
-            Operation operation = new Operation(inst, storageKind, dest, sources);
+            Operation operation = new(inst, storageKind, dest, sources);
 
             _operations.Add(operation);
 
@@ -100,7 +103,7 @@ namespace Ryujinx.Graphics.Shader.Translation
         {
             Operand[] dests = new[] { dest.Item1, dest.Item2 };
 
-            Operation operation = new Operation(inst, 0, dests, sources);
+            Operation operation = new(inst, 0, dests, sources);
 
             Add(operation);
 
@@ -110,36 +113,6 @@ namespace Ryujinx.Graphics.Shader.Translation
         public void Add(Operation operation)
         {
             _operations.Add(operation);
-        }
-
-        public TextureOperation CreateTextureOperation(
-            Instruction inst,
-            SamplerType type,
-            TextureFlags flags,
-            int handle,
-            int compIndex,
-            Operand[] dests,
-            params Operand[] sources)
-        {
-            return CreateTextureOperation(inst, type, TextureFormat.Unknown, flags, handle, compIndex, dests, sources);
-        }
-
-        public TextureOperation CreateTextureOperation(
-            Instruction inst,
-            SamplerType type,
-            TextureFormat format,
-            TextureFlags flags,
-            int handle,
-            int compIndex,
-            Operand[] dests,
-            params Operand[] sources)
-        {
-            if (!flags.HasFlag(TextureFlags.Bindless))
-            {
-                Config.SetUsedTexture(inst, type, format, flags, TextureOperation.DefaultCbufSlot, handle);
-            }
-
-            return new TextureOperation(inst, type, format, flags, handle, compIndex, dests, sources);
         }
 
         public void FlagAttributeRead(int attribute)
@@ -230,19 +203,58 @@ namespace Ryujinx.Graphics.Shader.Translation
 
         public void PrepareForVertexReturn()
         {
+            if (!Config.GpuAccessor.QueryHostSupportsTransformFeedback() && Config.GpuAccessor.QueryTransformFeedbackEnabled())
+            {
+                Operand vertexCount = this.Load(StorageKind.StorageBuffer, Constants.TfeInfoBinding, Const(1));
+
+                for (int tfbIndex = 0; tfbIndex < Constants.TfeBuffersCount; tfbIndex++)
+                {
+                    var locations = Config.GpuAccessor.QueryTransformFeedbackVaryingLocations(tfbIndex);
+                    var stride = Config.GpuAccessor.QueryTransformFeedbackStride(tfbIndex);
+
+                    Operand baseOffset = this.Load(StorageKind.StorageBuffer, Constants.TfeInfoBinding, Const(0), Const(tfbIndex));
+                    Operand baseVertex = this.Load(StorageKind.Input, IoVariable.BaseVertex);
+                    Operand baseInstance = this.Load(StorageKind.Input, IoVariable.BaseInstance);
+                    Operand vertexIndex = this.Load(StorageKind.Input, IoVariable.VertexIndex);
+                    Operand instanceIndex = this.Load(StorageKind.Input, IoVariable.InstanceIndex);
+
+                    Operand outputVertexOffset = this.ISubtract(vertexIndex, baseVertex);
+                    Operand outputInstanceOffset = this.ISubtract(instanceIndex, baseInstance);
+
+                    Operand outputBaseVertex = this.IMultiply(outputInstanceOffset, vertexCount);
+
+                    Operand vertexOffset = this.IMultiply(this.IAdd(outputBaseVertex, outputVertexOffset), Const(stride / 4));
+                    baseOffset = this.IAdd(baseOffset, vertexOffset);
+
+                    for (int j = 0; j < locations.Length; j++)
+                    {
+                        byte location = locations[j];
+                        if (location == 0xff)
+                        {
+                            continue;
+                        }
+
+                        Operand offset = this.IAdd(baseOffset, Const(j));
+                        Operand value = Instructions.AttributeMap.GenerateAttributeLoad(this, null, location * 4, isOutput: true, isPerPatch: false);
+
+                        this.Store(StorageKind.StorageBuffer, Constants.TfeBufferBaseBinding + tfbIndex, Const(0), offset, value);
+                    }
+                }
+            }
+
             if (Config.GpuAccessor.QueryViewportTransformDisable())
             {
                 Operand x = this.Load(StorageKind.Output, IoVariable.Position, null, Const(0));
                 Operand y = this.Load(StorageKind.Output, IoVariable.Position, null, Const(1));
-                Operand xScale = this.Load(StorageKind.Input, IoVariable.SupportBlockViewInverse, null, Const(0));
-                Operand yScale = this.Load(StorageKind.Input, IoVariable.SupportBlockViewInverse, null, Const(1));
+                Operand xScale = this.Load(StorageKind.ConstantBuffer, SupportBuffer.Binding, Const((int)SupportBufferField.ViewportInverse), Const(0));
+                Operand yScale = this.Load(StorageKind.ConstantBuffer, SupportBuffer.Binding, Const((int)SupportBufferField.ViewportInverse), Const(1));
                 Operand negativeOne = ConstF(-1.0f);
 
                 this.Store(StorageKind.Output, IoVariable.Position, null, Const(0), this.FPFusedMultiplyAdd(x, xScale, negativeOne));
                 this.Store(StorageKind.Output, IoVariable.Position, null, Const(1), this.FPFusedMultiplyAdd(y, yScale, negativeOne));
             }
 
-            if (Config.Options.TargetApi == TargetApi.Vulkan && Config.GpuAccessor.QueryTransformDepthMinusOneToOne() && !Config.GpuAccessor.QueryHostSupportsDepthClipControl())
+            if (Config.GpuAccessor.QueryTransformDepthMinusOneToOne() && !Config.GpuAccessor.QueryHostSupportsDepthClipControl())
             {
                 Operand z = this.Load(StorageKind.Output, IoVariable.Position, null, Const(2));
                 Operand w = this.Load(StorageKind.Output, IoVariable.Position, null, Const(3));
@@ -279,7 +291,7 @@ namespace Ryujinx.Graphics.Shader.Translation
                 oldYLocal = null;
             }
 
-            if (Config.Options.TargetApi == TargetApi.Vulkan && Config.GpuAccessor.QueryTransformDepthMinusOneToOne() && !Config.GpuAccessor.QueryHostSupportsDepthClipControl())
+            if (Config.GpuAccessor.QueryTransformDepthMinusOneToOne() && !Config.GpuAccessor.QueryHostSupportsDepthClipControl())
             {
                 oldZLocal = Local();
                 this.Copy(oldZLocal, this.Load(StorageKind.Output, IoVariable.Position, null, Const(2)));
@@ -387,7 +399,7 @@ namespace Ryujinx.Graphics.Shader.Translation
                             AlphaTestOp.Less => Instruction.CompareLess,
                             AlphaTestOp.LessOrEqual => Instruction.CompareLessOrEqual,
                             AlphaTestOp.NotEqual => Instruction.CompareNotEqual,
-                            _ => 0
+                            _ => 0,
                         };
 
                         Debug.Assert(comparator != 0, $"Invalid alpha test operation \"{alphaTestOp}\".");
@@ -420,7 +432,7 @@ namespace Ryujinx.Graphics.Shader.Translation
                         // Perform B <-> R swap if needed, for BGRA formats (not supported on OpenGL).
                         if (!supportsBgra && (component == 0 || component == 2))
                         {
-                            Operand isBgra = this.Load(StorageKind.Input, IoVariable.FragmentOutputIsBgra, null, Const(rtIndex));
+                            Operand isBgra = this.Load(StorageKind.ConstantBuffer, SupportBuffer.Binding, Const((int)SupportBufferField.FragmentIsBgra), Const(rtIndex));
 
                             Operand lblIsBgra = Label();
                             Operand lblEnd = Label();

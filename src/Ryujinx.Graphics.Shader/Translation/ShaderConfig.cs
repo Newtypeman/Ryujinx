@@ -2,16 +2,12 @@ using Ryujinx.Graphics.Shader.IntermediateRepresentation;
 using Ryujinx.Graphics.Shader.StructuredIr;
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Numerics;
 
 namespace Ryujinx.Graphics.Shader.Translation
 {
     class ShaderConfig
     {
-        // TODO: Non-hardcoded array size.
-        public const int SamplerArraySize = 4;
-
         private const int ThreadsPerWarp = 32;
 
         public ShaderStage Stage { get; }
@@ -38,6 +34,10 @@ namespace Ryujinx.Graphics.Shader.Translation
         public IGpuAccessor GpuAccessor { get; }
 
         public TranslationOptions Options { get; }
+
+        public ShaderProperties Properties => ResourceManager.Properties;
+
+        public ResourceManager ResourceManager { get; set; }
 
         public bool TransformFeedbackEnabled { get; }
 
@@ -106,58 +106,49 @@ namespace Ryujinx.Graphics.Shader.Translation
         public UInt128 NextInputAttributesComponents { get; private set; }
         public UInt128 ThisInputAttributesComponents { get; private set; }
 
-        public int AccessibleStorageBuffersMask { get; private set; }
-        public int AccessibleConstantBuffersMask { get; private set; }
-
-        private int _usedConstantBuffers;
-        private int _usedStorageBuffers;
-        private int _usedStorageBuffersWrite;
-
-        private readonly record struct TextureInfo(int CbufSlot, int Handle, bool Indexed, TextureFormat Format);
-
-        private struct TextureMeta
+        public ShaderConfig(ShaderStage stage, IGpuAccessor gpuAccessor, TranslationOptions options, int localMemorySize)
         {
-            public bool AccurateType;
-            public SamplerType Type;
-            public TextureUsageFlags UsageFlags;
-        }
-
-        private readonly Dictionary<TextureInfo, TextureMeta> _usedTextures;
-        private readonly Dictionary<TextureInfo, TextureMeta> _usedImages;
-
-        private readonly Dictionary<int, int> _sbSlots;
-        private readonly Dictionary<int, int> _sbSlotsReverse;
-
-        private BufferDescriptor[] _cachedConstantBufferDescriptors;
-        private BufferDescriptor[] _cachedStorageBufferDescriptors;
-        private TextureDescriptor[] _cachedTextureDescriptors;
-        private TextureDescriptor[] _cachedImageDescriptors;
-
-        private int _firstConstantBufferBinding;
-        private int _firstStorageBufferBinding;
-
-        public int FirstConstantBufferBinding => _firstConstantBufferBinding;
-        public int FirstStorageBufferBinding => _firstStorageBufferBinding;
-
-        public ShaderConfig(IGpuAccessor gpuAccessor, TranslationOptions options)
-        {
-            Stage       = ShaderStage.Compute;
+            Stage = stage;
             GpuAccessor = gpuAccessor;
-            Options     = options;
+            Options = options;
+            LocalMemorySize = localMemorySize;
 
             _transformFeedbackDefinitions = new Dictionary<TransformFeedbackVariable, TransformFeedbackOutput>();
 
-            AccessibleStorageBuffersMask  = (1 << GlobalMemory.StorageMaxCount) - 1;
-            AccessibleConstantBuffersMask = (1 << GlobalMemory.UbeMaxCount) - 1;
+            TransformFeedbackEnabled =
+                stage != ShaderStage.Compute &&
+                gpuAccessor.QueryTransformFeedbackEnabled() &&
+                gpuAccessor.QueryHostSupportsTransformFeedback();
 
-            UsedInputAttributesPerPatch  = new HashSet<int>();
+            UsedInputAttributesPerPatch = new HashSet<int>();
             UsedOutputAttributesPerPatch = new HashSet<int>();
 
-            _usedTextures = new Dictionary<TextureInfo, TextureMeta>();
-            _usedImages   = new Dictionary<TextureInfo, TextureMeta>();
+            ResourceManager = new ResourceManager(stage, gpuAccessor, new ShaderProperties());
 
-            _sbSlots        = new Dictionary<int, int>();
-            _sbSlotsReverse = new Dictionary<int, int>();
+            if (!gpuAccessor.QueryHostSupportsTransformFeedback() && gpuAccessor.QueryTransformFeedbackEnabled())
+            {
+                StructureType tfeInfoStruct = new(new StructureField[]
+                {
+                    new(AggregateType.Array | AggregateType.U32, "base_offset", 4),
+                    new(AggregateType.U32, "vertex_count"),
+                });
+
+                BufferDefinition tfeInfoBuffer = new(BufferLayout.Std430, 1, Constants.TfeInfoBinding, "tfe_info", tfeInfoStruct);
+
+                Properties.AddOrUpdateStorageBuffer(Constants.TfeInfoBinding, tfeInfoBuffer);
+
+                StructureType tfeDataStruct = new(new StructureField[]
+                {
+                    new(AggregateType.Array | AggregateType.U32, "data", 0),
+                });
+
+                for (int i = 0; i < Constants.TfeBuffersCount; i++)
+                {
+                    int binding = Constants.TfeBufferBaseBinding + i;
+                    BufferDefinition tfeDataBuffer = new(BufferLayout.Std430, 1, binding, $"tfe_data{i}", tfeDataStruct);
+                    Properties.AddOrUpdateStorageBuffer(binding, tfeDataBuffer);
+                }
+            }
         }
 
         public ShaderConfig(
@@ -165,34 +156,32 @@ namespace Ryujinx.Graphics.Shader.Translation
             OutputTopology outputTopology,
             int maxOutputVertices,
             IGpuAccessor gpuAccessor,
-            TranslationOptions options) : this(gpuAccessor, options)
+            TranslationOptions options) : this(stage, gpuAccessor, options, 0)
         {
-            Stage                    = stage;
             ThreadsPerInputPrimitive = 1;
-            OutputTopology           = outputTopology;
-            MaxOutputVertices        = maxOutputVertices;
-            TransformFeedbackEnabled = gpuAccessor.QueryTransformFeedbackEnabled();
-
-            if (Stage != ShaderStage.Compute)
-            {
-                AccessibleConstantBuffersMask = 0;
-            }
+            OutputTopology = outputTopology;
+            MaxOutputVertices = maxOutputVertices;
         }
 
-        public ShaderConfig(ShaderHeader header, IGpuAccessor gpuAccessor, TranslationOptions options) : this(gpuAccessor, options)
+        public ShaderConfig(
+            ShaderHeader header,
+            IGpuAccessor gpuAccessor,
+            TranslationOptions options) : this(header.Stage, gpuAccessor, options, GetLocalMemorySize(header))
         {
-            Stage                    = header.Stage;
-            GpPassthrough            = header.Stage == ShaderStage.Geometry && header.GpPassthrough;
+            GpPassthrough = header.Stage == ShaderStage.Geometry && header.GpPassthrough;
             ThreadsPerInputPrimitive = header.ThreadsPerInputPrimitive;
-            OutputTopology           = header.OutputTopology;
-            MaxOutputVertices        = header.MaxOutputVertexCount;
-            LocalMemorySize          = header.ShaderLocalMemoryLowSize + header.ShaderLocalMemoryHighSize + (header.ShaderLocalMemoryCrsSize / ThreadsPerWarp);
-            ImapTypes                = header.ImapTypes;
-            OmapTargets              = header.OmapTargets;
-            OmapSampleMask           = header.OmapSampleMask;
-            OmapDepth                = header.OmapDepth;
-            TransformFeedbackEnabled = gpuAccessor.QueryTransformFeedbackEnabled();
-            LastInVertexPipeline     = header.Stage < ShaderStage.Fragment;
+            OutputTopology = header.OutputTopology;
+            MaxOutputVertices = header.MaxOutputVertexCount;
+            ImapTypes = header.ImapTypes;
+            OmapTargets = header.OmapTargets;
+            OmapSampleMask = header.OmapSampleMask;
+            OmapDepth = header.OmapDepth;
+            LastInVertexPipeline = header.Stage < ShaderStage.Fragment;
+        }
+
+        private static int GetLocalMemorySize(ShaderHeader header)
+        {
+            return header.ShaderLocalMemoryLowSize + header.ShaderLocalMemoryHighSize + (header.ShaderLocalMemoryCrsSize / ThreadsPerWarp);
         }
 
         private void EnsureTransformFeedbackInitialized()
@@ -433,25 +422,6 @@ namespace Ryujinx.Graphics.Shader.Translation
 
             UsedInputAttributes |= other.UsedInputAttributes;
             UsedOutputAttributes |= other.UsedOutputAttributes;
-            _usedConstantBuffers |= other._usedConstantBuffers;
-            _usedStorageBuffers |= other._usedStorageBuffers;
-            _usedStorageBuffersWrite |= other._usedStorageBuffersWrite;
-
-            foreach (var kv in other._usedTextures)
-            {
-                if (!_usedTextures.TryAdd(kv.Key, kv.Value))
-                {
-                    _usedTextures[kv.Key] = MergeTextureMeta(kv.Value, _usedTextures[kv.Key]);
-                }
-            }
-
-            foreach (var kv in other._usedImages)
-            {
-                if (!_usedImages.TryAdd(kv.Key, kv.Value))
-                {
-                    _usedImages[kv.Key] = MergeTextureMeta(kv.Value, _usedImages[kv.Key]);
-                }
-            }
         }
 
         public void SetLayerOutputAttribute(int attr)
@@ -517,7 +487,7 @@ namespace Ryujinx.Graphics.Shader.Translation
                 // Regular and per-patch input/output locations can't overlap,
                 // so we must assign on our location using unused regular input/output locations.
 
-                Dictionary<int, int> locationsMap = new Dictionary<int, int>();
+                Dictionary<int, int> locationsMap = new();
 
                 int freeMask = ~UsedOutputAttributes;
 
@@ -635,384 +605,13 @@ namespace Ryujinx.Graphics.Shader.Translation
             UsedFeatures |= flags;
         }
 
-        public void SetAccessibleBufferMasks(int sbMask, int ubeMask)
-        {
-            AccessibleStorageBuffersMask = sbMask;
-            AccessibleConstantBuffersMask = ubeMask;
-        }
-
-        public void SetUsedConstantBuffer(int slot)
-        {
-            _usedConstantBuffers |= 1 << slot;
-        }
-
-        public void SetUsedStorageBuffer(int slot, bool write)
-        {
-            int mask = 1 << slot;
-            _usedStorageBuffers |= mask;
-
-            if (write)
-            {
-                _usedStorageBuffersWrite |= mask;
-            }
-        }
-
-        public void SetUsedTexture(
-            Instruction inst,
-            SamplerType type,
-            TextureFormat format,
-            TextureFlags flags,
-            int cbufSlot,
-            int handle)
-        {
-            inst &= Instruction.Mask;
-            bool isImage = inst == Instruction.ImageLoad || inst == Instruction.ImageStore || inst == Instruction.ImageAtomic;
-            bool isWrite = inst == Instruction.ImageStore || inst == Instruction.ImageAtomic;
-            bool accurateType = inst != Instruction.Lod && inst != Instruction.TextureSize;
-            bool coherent = flags.HasFlag(TextureFlags.Coherent);
-
-            if (isImage)
-            {
-                SetUsedTextureOrImage(_usedImages, cbufSlot, handle, type, format, true, isWrite, false, coherent);
-            }
-            else
-            {
-                bool intCoords = flags.HasFlag(TextureFlags.IntCoords) || inst == Instruction.TextureSize;
-                SetUsedTextureOrImage(_usedTextures, cbufSlot, handle, type, TextureFormat.Unknown, intCoords, false, accurateType, coherent);
-            }
-
-            GpuAccessor.RegisterTexture(handle, cbufSlot);
-        }
-
-        private void SetUsedTextureOrImage(
-            Dictionary<TextureInfo, TextureMeta> dict,
-            int cbufSlot,
-            int handle,
-            SamplerType type,
-            TextureFormat format,
-            bool intCoords,
-            bool write,
-            bool accurateType,
-            bool coherent)
-        {
-            var dimensions = type.GetDimensions();
-            var isIndexed = type.HasFlag(SamplerType.Indexed);
-
-            var usageFlags = TextureUsageFlags.None;
-
-            if (intCoords)
-            {
-                usageFlags |= TextureUsageFlags.NeedsScaleValue;
-
-                var canScale = Stage.SupportsRenderScale() && !isIndexed && !write && dimensions == 2;
-
-                if (!canScale)
-                {
-                    // Resolution scaling cannot be applied to this texture right now.
-                    // Flag so that we know to blacklist scaling on related textures when binding them.
-                    usageFlags |= TextureUsageFlags.ResScaleUnsupported;
-                }
-            }
-
-            if (write)
-            {
-                usageFlags |= TextureUsageFlags.ImageStore;
-            }
-
-            if (coherent)
-            {
-                usageFlags |= TextureUsageFlags.ImageCoherent;
-            }
-
-            int arraySize = isIndexed ? SamplerArraySize : 1;
-
-            for (int layer = 0; layer < arraySize; layer++)
-            {
-                var info = new TextureInfo(cbufSlot, handle + layer * 2, isIndexed, format);
-                var meta = new TextureMeta()
-                {
-                    AccurateType = accurateType,
-                    Type = type,
-                    UsageFlags = usageFlags
-                };
-
-                if (dict.TryGetValue(info, out var existingMeta))
-                {
-                    dict[info] = MergeTextureMeta(meta, existingMeta);
-                }
-                else
-                {
-                    dict.Add(info, meta);
-                }
-            }
-        }
-
-        private static TextureMeta MergeTextureMeta(TextureMeta meta, TextureMeta existingMeta)
-        {
-            meta.UsageFlags |= existingMeta.UsageFlags;
-
-            // If the texture we have has inaccurate type information, then
-            // we prefer the most accurate one.
-            if (existingMeta.AccurateType)
-            {
-                meta.AccurateType = true;
-                meta.Type = existingMeta.Type;
-            }
-
-            return meta;
-        }
-
-        public BufferDescriptor[] GetConstantBufferDescriptors()
-        {
-            if (_cachedConstantBufferDescriptors != null)
-            {
-                return _cachedConstantBufferDescriptors;
-            }
-
-            int usedMask = _usedConstantBuffers;
-
-            if (UsedFeatures.HasFlag(FeatureFlags.CbIndexing))
-            {
-                usedMask |= (int)GpuAccessor.QueryConstantBufferUse();
-            }
-
-            return _cachedConstantBufferDescriptors = GetUniformBufferDescriptors(
-                usedMask,
-                UsedFeatures.HasFlag(FeatureFlags.CbIndexing),
-                out _firstConstantBufferBinding,
-                GpuAccessor.QueryBindingConstantBuffer);
-        }
-
-        public BufferDescriptor[] GetStorageBufferDescriptors()
-        {
-            if (_cachedStorageBufferDescriptors != null)
-            {
-                return _cachedStorageBufferDescriptors;
-            }
-
-            return _cachedStorageBufferDescriptors = GetStorageBufferDescriptors(
-                _usedStorageBuffers,
-                _usedStorageBuffersWrite,
-                true,
-                out _firstStorageBufferBinding,
-                GpuAccessor.QueryBindingStorageBuffer);
-        }
-
-        private static BufferDescriptor[] GetUniformBufferDescriptors(int usedMask, bool isArray, out int firstBinding, Func<int, int> getBindingCallback)
-        {
-            firstBinding = 0;
-            int lastSlot = -1;
-            bool hasFirstBinding = false;
-            var descriptors = new BufferDescriptor[BitOperations.PopCount((uint)usedMask)];
-
-            for (int i = 0; i < descriptors.Length; i++)
-            {
-                int slot = BitOperations.TrailingZeroCount(usedMask);
-
-                if (isArray)
-                {
-                    // The next array entries also consumes bindings, even if they are unused.
-                    for (int j = lastSlot + 1; j < slot; j++)
-                    {
-                        int binding = getBindingCallback(j);
-
-                        if (!hasFirstBinding)
-                        {
-                            firstBinding = binding;
-                            hasFirstBinding = true;
-                        }
-                    }
-                }
-
-                lastSlot = slot;
-                descriptors[i] = new BufferDescriptor(getBindingCallback(slot), slot);
-
-                if (!hasFirstBinding)
-                {
-                    firstBinding = descriptors[i].Binding;
-                    hasFirstBinding = true;
-                }
-
-                usedMask &= ~(1 << slot);
-            }
-
-            return descriptors;
-        }
-
-        private BufferDescriptor[] GetStorageBufferDescriptors(
-            int usedMask,
-            int writtenMask,
-            bool isArray,
-            out int firstBinding,
-            Func<int, int> getBindingCallback)
-        {
-            firstBinding = 0;
-            bool hasFirstBinding = false;
-            var descriptors = new BufferDescriptor[BitOperations.PopCount((uint)usedMask)];
-
-            int lastSlot = -1;
-
-            for (int i = 0; i < descriptors.Length; i++)
-            {
-                int slot = BitOperations.TrailingZeroCount(usedMask);
-
-                if (isArray)
-                {
-                    // The next array entries also consumes bindings, even if they are unused.
-                    for (int j = lastSlot + 1; j < slot; j++)
-                    {
-                        int binding = getBindingCallback(j);
-
-                        if (!hasFirstBinding)
-                        {
-                            firstBinding = binding;
-                            hasFirstBinding = true;
-                        }
-                    }
-                }
-
-                lastSlot = slot;
-
-                (int sbCbSlot, int sbCbOffset) = GetSbCbInfo(slot);
-
-                descriptors[i] = new BufferDescriptor(getBindingCallback(slot), slot, sbCbSlot, sbCbOffset);
-
-                if (!hasFirstBinding)
-                {
-                    firstBinding = descriptors[i].Binding;
-                    hasFirstBinding = true;
-                }
-
-                if ((writtenMask & (1 << slot)) != 0)
-                {
-                    descriptors[i].SetFlag(BufferUsageFlags.Write);
-                }
-
-                usedMask &= ~(1 << slot);
-            }
-
-            return descriptors;
-        }
-
-        public TextureDescriptor[] GetTextureDescriptors()
-        {
-            return _cachedTextureDescriptors ??= GetTextureOrImageDescriptors(_usedTextures, GpuAccessor.QueryBindingTexture);
-        }
-
-        public TextureDescriptor[] GetImageDescriptors()
-        {
-            return _cachedImageDescriptors ??= GetTextureOrImageDescriptors(_usedImages, GpuAccessor.QueryBindingImage);
-        }
-
-        private static TextureDescriptor[] GetTextureOrImageDescriptors(Dictionary<TextureInfo, TextureMeta> dict, Func<int, bool, int> getBindingCallback)
-        {
-            var descriptors = new TextureDescriptor[dict.Count];
-
-            int i = 0;
-            foreach (var kv in dict.OrderBy(x => x.Key.Indexed).OrderBy(x => x.Key.Handle))
-            {
-                var info = kv.Key;
-                var meta = kv.Value;
-
-                bool isBuffer = (meta.Type & SamplerType.Mask) == SamplerType.TextureBuffer;
-                int binding = getBindingCallback(i, isBuffer);
-
-                descriptors[i] = new TextureDescriptor(binding, meta.Type, info.Format, info.CbufSlot, info.Handle);
-                descriptors[i].SetFlag(meta.UsageFlags);
-                i++;
-            }
-
-            return descriptors;
-        }
-
-        public (TextureDescriptor, int) FindTextureDescriptor(AstTextureOperation texOp)
-        {
-            TextureDescriptor[] descriptors = GetTextureDescriptors();
-
-            for (int i = 0; i < descriptors.Length; i++)
-            {
-                var descriptor = descriptors[i];
-
-                if (descriptor.CbufSlot == texOp.CbufSlot &&
-                    descriptor.HandleIndex == texOp.Handle &&
-                    descriptor.Format == texOp.Format)
-                {
-                    return (descriptor, i);
-                }
-            }
-
-            return (default, -1);
-        }
-
-        private static int FindDescriptorIndex(TextureDescriptor[] array, AstTextureOperation texOp)
-        {
-            for (int i = 0; i < array.Length; i++)
-            {
-                var descriptor = array[i];
-
-                if (descriptor.Type == texOp.Type &&
-                    descriptor.CbufSlot == texOp.CbufSlot &&
-                    descriptor.HandleIndex == texOp.Handle &&
-                    descriptor.Format == texOp.Format)
-                {
-                    return i;
-                }
-            }
-
-            return -1;
-        }
-
-        public int FindTextureDescriptorIndex(AstTextureOperation texOp)
-        {
-            return FindDescriptorIndex(GetTextureDescriptors(), texOp);
-        }
-
-        public int FindImageDescriptorIndex(AstTextureOperation texOp)
-        {
-            return FindDescriptorIndex(GetImageDescriptors(), texOp);
-        }
-
-        public int GetSbSlot(byte sbCbSlot, ushort sbCbOffset)
-        {
-            int key = PackSbCbInfo(sbCbSlot, sbCbOffset);
-
-            if (!_sbSlots.TryGetValue(key, out int slot))
-            {
-                slot = _sbSlots.Count;
-                _sbSlots.Add(key, slot);
-                _sbSlotsReverse.Add(slot, key);
-            }
-
-            return slot;
-        }
-
-        public (int, int) GetSbCbInfo(int slot)
-        {
-            if (_sbSlotsReverse.TryGetValue(slot, out int key))
-            {
-                return UnpackSbCbInfo(key);
-            }
-
-            throw new ArgumentException($"Invalid slot {slot}.", nameof(slot));
-        }
-
-        private static int PackSbCbInfo(int sbCbSlot, int sbCbOffset)
-        {
-            return sbCbOffset | ((int)sbCbSlot << 16);
-        }
-
-        private static (int, int) UnpackSbCbInfo(int key)
-        {
-            return ((byte)(key >> 16), (ushort)key);
-        }
-
         public ShaderProgramInfo CreateProgramInfo(ShaderIdentification identification = ShaderIdentification.None)
         {
             return new ShaderProgramInfo(
-                GetConstantBufferDescriptors(),
-                GetStorageBufferDescriptors(),
-                GetTextureDescriptors(),
-                GetImageDescriptors(),
+                ResourceManager.GetConstantBufferDescriptors(),
+                ResourceManager.GetStorageBufferDescriptors(),
+                ResourceManager.GetTextureDescriptors(),
+                ResourceManager.GetImageDescriptors(),
                 identification,
                 GpLayerInputAttribute,
                 Stage,
